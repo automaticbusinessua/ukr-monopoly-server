@@ -184,6 +184,12 @@ function generateRoomId() {
 function getLobbyRoomsList() {
   const list = [];
   rooms.forEach((r, id) => {
+    // Не повертати кімнати без активних живих гравців
+    const activeHumans = r.players.filter(p => !p.isBot && !p.bankrupt && p.ws && p.ws.readyState === WebSocket.OPEN);
+    if (r.status === "playing" && activeHumans.length === 0) {
+      return;
+    }
+
     list.push({
       id: r.id,
       name: r.name,
@@ -195,7 +201,7 @@ function getLobbyRoomsList() {
       status: r.status, // "waiting" | "playing" | "finished"
       startingCash: r.settings.startingCash,
       mode: r.settings.mode || "classic",
-      turnTimer: r.settings.turnTimer || 90,
+      turnTimer: r.settings.turnTimer || 120,
       createdAt: r.createdAt,
       players: r.players.map(p => ({
         id: p.id,
@@ -533,7 +539,7 @@ wss.on("connection", (ws, req) => {
           const maxPlayers = Math.min(4, Math.max(2, Number(data.maxPlayers) || 4));
           const botCount = Math.min(maxPlayers - 1, Math.max(0, Number(data.botCount) || 0));
           const mode = data.mode === "turbo" ? "turbo" : "classic";
-          const turnTimer = [60, 90, 120].includes(Number(data.turnTimer)) ? Number(data.turnTimer) : 90;
+          const turnTimer = [30, 45, 60, 90, 120].includes(Number(data.turnTimer)) ? Number(data.turnTimer) : 120;
 
           const hostPlayer = {
             id: hostId,
@@ -834,6 +840,18 @@ function sendSystemRoomNotice(room, text) {
   });
 }
 
+function clearRoomTurnTimers(room) {
+  if (!room) return;
+  if (room.turnTimeoutTimer) {
+    clearTimeout(room.turnTimeoutTimer);
+    room.turnTimeoutTimer = null;
+  }
+  if (room.turnWarningTimer) {
+    clearTimeout(room.turnWarningTimer);
+    room.turnWarningTimer = null;
+  }
+}
+
 function handlePlayerDisconnect(roomId, playerId) {
   const r = rooms.get(roomId);
   if (!r) return;
@@ -842,32 +860,35 @@ function handlePlayerDisconnect(roomId, playerId) {
 
   // Рахуємо підключених живих людей
   const connectedHumans = r.players.filter(pl => !pl.isBot && pl.ws && pl.ws.readyState === WebSocket.OPEN);
+  const activeHumans = r.players.filter(pl => !pl.isBot && !pl.bankrupt && pl.ws && pl.ws.readyState === WebSocket.OPEN);
 
   if (r.status === "waiting") {
     handlePlayerLeave(roomId, playerId);
   } else {
-    // Якщо під час партії всі люди відключилися — даємо 30 сек на повернення, або якщо ніхто не повернувся — закриваємо
+    // Якщо під час партії немає жодного підключеного гравця-людини
     if (connectedHumans.length === 0) {
       if (r.emptyRoomTimer) clearTimeout(r.emptyRoomTimer);
       r.emptyRoomTimer = setTimeout(() => {
         const curRoom = rooms.get(roomId);
         if (!curRoom) return;
-        const stillOnline = curRoom.players.filter(pl => !pl.isBot && pl.ws && pl.ws.readyState === WebSocket.OPEN);
+        const stillOnline = curRoom.players.filter(pl => !pl.isBot && !pl.bankrupt && pl.ws && pl.ws.readyState === WebSocket.OPEN);
         if (stillOnline.length === 0) {
+          clearRoomTurnTimers(curRoom);
           rooms.delete(roomId);
           broadcastToLobby({
             type: "ROOMS_UPDATED",
             rooms: getLobbyRoomsList()
           });
         }
-      }, 30000);
+        curRoom.emptyRoomTimer = null;
+      }, 15000);
     } else {
-      if (r.hostId === playerId && connectedHumans.length > 0) {
-        r.hostId = connectedHumans[0].id;
-        r.hostName = connectedHumans[0].name;
-        connectedHumans[0].isHost = true;
+      if (r.hostId === playerId && activeHumans.length > 0) {
+        r.hostId = activeHumans[0].id;
+        r.hostName = activeHumans[0].name;
+        activeHumans[0].isHost = true;
       }
-      if (p) {
+      if (p && !p.bankrupt) {
         sendSystemRoomNotice(r, `⚠️ ${p.name} покинув кімнату. У нього є 30 сек на повернення...`);
         if (p.reconnectTimer) clearTimeout(p.reconnectTimer);
         p.reconnectTimer = setTimeout(() => {
@@ -882,6 +903,16 @@ function handlePlayerDisconnect(roomId, playerId) {
               curRoom.tileState[idx] = { ownerId: null, stars: 0, mortgaged: false };
             }
           });
+
+          // Перевіряємо чи залишились живі не-банкрути люди
+          const remainingActive = curRoom.players.filter(x => !x.isBot && !x.bankrupt && x.ws && x.ws.readyState === WebSocket.OPEN);
+          if (remainingActive.length === 0) {
+            clearRoomTurnTimers(curRoom);
+            rooms.delete(roomId);
+            broadcastToLobby({ type: "ROOMS_UPDATED", rooms: getLobbyRoomsList() });
+            return;
+          }
+
           if (curRoom.players[curRoom.currentTurnIndex]?.id === target.id) {
             let nextIdx = (curRoom.currentTurnIndex + 1) % curRoom.players.length;
             let guard = 0;
@@ -890,6 +921,7 @@ function handlePlayerDisconnect(roomId, playerId) {
               guard++;
             }
             curRoom.currentTurnIndex = nextIdx;
+            startTurnTimeout(curRoom);
           }
           sendSystemRoomNotice(curRoom, `🚪 ${target.name} остаточно покинув кімнату (30 сек вичерпано).`);
           broadcastToRoom(curRoom.id, {
@@ -897,6 +929,7 @@ function handlePlayerDisconnect(roomId, playerId) {
             action: "STATE_SYNCED",
             room: serializeRoom(curRoom)
           });
+          checkAndRunBotTurn(curRoom);
         }, 30000);
       }
       broadcastToRoom(r.id, {
@@ -925,6 +958,7 @@ function handlePlayerLeave(roomId, playerId) {
   const remainingHumans = r.players.filter(p => !p.isBot);
 
   if (remainingHumans.length === 0) {
+    clearRoomTurnTimers(r);
     rooms.delete(roomId);
   } else {
     if (r.hostId === playerId) {
@@ -948,33 +982,59 @@ function handlePlayerLeave(roomId, playerId) {
   });
 }
 
-// Автоматичне очищення старих та завислих кімнат (кожні 10 секунд)
+// Автоматичне очищення старих та завислих кімнат (кожні 5 секунд)
 setInterval(() => {
   const now = Date.now();
   let changed = false;
 
   rooms.forEach((r, roomId) => {
     const connectedHumans = r.players.filter(p => !p.isBot && p.ws && p.ws.readyState === WebSocket.OPEN);
+    const activeHumans = r.players.filter(p => !p.isBot && !p.bankrupt && p.ws && p.ws.readyState === WebSocket.OPEN);
 
-    // 1. Жодного підключеного гравця-людини (якщо не триває 30-секундне очікування повернення)
-    if (connectedHumans.length === 0 && !r.emptyRoomTimer) {
-      rooms.delete(roomId);
-      changed = true;
-      return;
+    // 1. Якщо у кімнаті немає ЖОДНОГО активного живого гравця-людини
+    if (activeHumans.length === 0) {
+      if (!r.noHumansSince) {
+        r.noHumansSince = now;
+      } else if (now - r.noHumansSince > 15000) {
+        clearRoomTurnTimers(r);
+        if (r.emptyRoomTimer) clearTimeout(r.emptyRoomTimer);
+        rooms.delete(roomId);
+        changed = true;
+        return;
+      }
+    } else {
+      r.noHumansSince = null;
     }
 
-    // 2. Кімната в очікуванні (waiting) створена понад 15 хвилин тому
+    // 2. Якщо взагалі 0 підключених людей (навіть банкрутів)
+    if (connectedHumans.length === 0) {
+      if (!r.emptySince) {
+        r.emptySince = now;
+      } else if (now - r.emptySince > 15000) {
+        clearRoomTurnTimers(r);
+        if (r.emptyRoomTimer) clearTimeout(r.emptyRoomTimer);
+        rooms.delete(roomId);
+        changed = true;
+        return;
+      }
+    } else {
+      r.emptySince = null;
+    }
+
+    // 3. Кімната в очікуванні (waiting) створена понад 15 хвилин тому
     if (r.status === "waiting" && now - r.createdAt > 15 * 60 * 1000) {
       broadcastToRoom(roomId, { type: "ROOM_CLOSED", reason: "Кімнату закрито через неактивність (таймаут)" });
+      clearRoomTurnTimers(r);
       rooms.delete(roomId);
       changed = true;
       return;
     }
 
-    // 3. Зависла партія без дій понад 30 хвилин
+    // 4. Зависла партія без дій понад 30 хвилин
     const lastActive = r.lastActivityAt || r.createdAt;
     if (now - lastActive > 30 * 60 * 1000) {
       broadcastToRoom(roomId, { type: "ROOM_CLOSED", reason: "Партію закрито через тривалий простій" });
+      clearRoomTurnTimers(r);
       rooms.delete(roomId);
       changed = true;
       return;
@@ -987,7 +1047,7 @@ setInterval(() => {
       rooms: getLobbyRoomsList()
     });
   }
-}, 10000);
+}, 5000);
 
 // ----------------------------------------------------------------------------
 // СИНХРОНІЗАЦІЯ ІГРОВИХ ДІЙ
@@ -1232,18 +1292,40 @@ function handleGameAction(room, playerId, action, payload, senderWs) {
 
 function startTurnTimeout(room) {
   if (!room || room.status !== "playing") return;
-  if (room.turnTimeoutTimer) {
-    clearTimeout(room.turnTimeoutTimer);
-    room.turnTimeoutTimer = null;
-  }
+  clearRoomTurnTimers(room);
+
   const curPlayer = room.players[room.currentTurnIndex];
   if (!curPlayer || curPlayer.isBot || curPlayer.bankrupt) {
     room.turnDeadline = null;
     return;
   }
 
-  const maxTurnSec = Math.min(60, Math.max(15, Number(room.settings?.turnTimer) || 60));
+  // Час на хід: за замовчуванням 120 сек (2 хвилини), мінімум 30 сек, максимум 120 сек
+  const maxTurnSec = Math.min(120, Math.max(30, Number(room.settings?.turnTimer) || 120));
   room.turnDeadline = Date.now() + maxTurnSec * 1000;
+
+  // Якщо час на хід більше 60 сек, плануємо сповіщення за 60 секунд до кіку
+  if (maxTurnSec > 60) {
+    const warningMs = (maxTurnSec - 60) * 1000;
+    room.turnWarningTimer = setTimeout(() => {
+      const r = rooms.get(room.id);
+      if (!r || r.status !== "playing") return;
+      const p = r.players[r.currentTurnIndex];
+      if (!p || p.id !== curPlayer.id || p.isBot || p.bankrupt) return;
+
+      sendSystemRoomNotice(r, `⚠️ ${p.name}, у вас залишилась 1 хвилина на хід! Покваптесь!`);
+      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+        try {
+          p.ws.send(JSON.stringify({
+            type: "TURN_WARNING",
+            playerId: p.id,
+            secondsLeft: 60,
+            message: "⚠️ У вас залишилась 1 хвилина на хід! Покваптесь, інакше вас виключить з кімнати."
+          }));
+        } catch (e) {}
+      }
+    }, warningMs);
+  }
 
   room.turnTimeoutTimer = setTimeout(() => {
     const r = rooms.get(room.id);
@@ -1258,18 +1340,23 @@ function startTurnTimeout(room) {
       }
     });
 
-    sendSystemRoomNotice(r, `⏱️ ${p.name} не походив за ${maxTurnSec} сек і був виключений з кімнати!`);
+    sendSystemRoomNotice(r, `⏱️ ${p.name} не походив за 2 хвилини і був виключений з кімнати!`);
 
     if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(JSON.stringify({
-        type: "ROOM_CLOSED",
-        reason: `Час на хід вичерпано (${maxTurnSec} сек). Вас виключено з кімнати за неактивність.`
-      }));
+      try {
+        p.ws.send(JSON.stringify({
+          type: "ROOM_CLOSED",
+          reason: `Час на хід вичерпано (2 хвилини). Вас виключено з кімнати за неактивність.`
+        }));
+        p.ws.close(4001, "Turn timeout");
+      } catch (e) {}
       p.ws = null;
     }
 
     const aliveHumans = r.players.filter(x => !x.isBot && !x.bankrupt && x.ws && x.ws.readyState === WebSocket.OPEN);
     if (aliveHumans.length === 0) {
+      clearRoomTurnTimers(r);
+      if (r.emptyRoomTimer) clearTimeout(r.emptyRoomTimer);
       rooms.delete(r.id);
       broadcastToLobby({ type: "ROOMS_UPDATED", rooms: getLobbyRoomsList() });
       return;
