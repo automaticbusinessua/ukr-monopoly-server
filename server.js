@@ -1098,17 +1098,57 @@ function handleGameAction(room, playerId, action, payload, senderWs) {
     }
 
     case "SYNC_FULL_STATE": {
-      // Синхронізація від хоста
-      if (payload && payload.tileState) {
+      if (!payload) break;
+      if (Array.isArray(payload.players)) {
+        payload.players.forEach(sp => {
+          const target = room.players.find(p => p.id === sp.id);
+          if (target) {
+            target.cash = typeof sp.cash === "number" ? sp.cash : target.cash;
+            target.position = typeof sp.position === "number" ? sp.position : target.position;
+            target.inJail = Boolean(sp.inJail);
+            target.jailTurns = sp.jailTurns || 0;
+            target.connection = sp.connection || null;
+            target.bankrupt = Boolean(sp.bankrupt);
+            target.immunityTurns = sp.immunityTurns || 0;
+          }
+        });
+      }
+      if (payload.tileState) {
         room.tileState = payload.tileState;
       }
-      if (payload && payload.offshorePot !== undefined) {
+      if (payload.offshorePot !== undefined) {
         room.offshorePot = payload.offshorePot;
       }
+      if (typeof payload.currentTurnIndex === "number") {
+        room.currentTurnIndex = payload.currentTurnIndex;
+      }
+      if (payload.turnPhase) {
+        room.turnPhase = payload.turnPhase;
+      }
+      if (Array.isArray(payload.lastDice)) {
+        room.lastDice = payload.lastDice;
+      }
+      if (typeof payload.selectedTileIndex === "number") {
+        room.selectedTileIndex = payload.selectedTileIndex;
+      }
+      if (typeof payload.doublesCount === "number") {
+        room.doublesCount = payload.doublesCount;
+      }
+      if (Array.isArray(payload.recentLogs)) {
+        room.recentLogs = payload.recentLogs;
+      }
+
+      const serialized = serializeRoom(room);
+      serialized.turnPhase = room.turnPhase;
+      serialized.lastDice = room.lastDice;
+      serialized.selectedTileIndex = room.selectedTileIndex;
+      serialized.doublesCount = room.doublesCount;
+      serialized.recentLogs = room.recentLogs;
+
       broadcastToRoom(room.id, {
         type: "ACTION_BROADCAST",
         action: "STATE_SYNCED",
-        room: serializeRoom(room)
+        room: serialized
       }, senderWs);
       break;
     }
