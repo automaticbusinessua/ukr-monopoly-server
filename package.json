@@ -1,0 +1,12 @@
+﻿{
+    "version":  "1.0.0",
+    "name":  "ukr-monopoly-server",
+    "description":  "WebSocket \u0026 API server for Ukrainian Monopoly",
+    "scripts":  {
+                    "start":  "node server.js"
+                },
+    "dependencies":  {
+                         "ws":  "^8.23.0"
+                     },
+    "main":  "server.js"
+}
