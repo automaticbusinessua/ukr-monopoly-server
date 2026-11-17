@@ -930,30 +930,27 @@ function handleGameAction(room, playerId, action, payload, senderWs) {
 
       const d1 = payload?.dice ? payload.dice[0] : Math.floor(1 + Math.random() * 6);
       const d2 = payload?.dice ? payload.dice[1] : Math.floor(1 + Math.random() * 6);
-      const steps = d1 + d2;
+      const steps = payload?.steps || (d1 + d2);
       const isDouble = d1 === d2;
 
-      const oldPos = curPlayer.position;
+      const oldPos = typeof payload?.fromPos === "number" ? payload.fromPos : curPlayer.position;
       const newPos = (oldPos + steps) % 28;
       const passedGo = newPos < oldPos;
 
       curPlayer.position = newPos;
-      if (passedGo) {
-        curPlayer.cash += 2000;
-      }
 
       broadcastToRoom(room.id, {
         type: "ACTION_BROADCAST",
         action: "DICE_ROLLED",
-        playerId: curPlayer.id,
+        playerId: payload?.playerId || curPlayer.id,
         dice: [d1, d2],
         isDouble: isDouble,
         steps: steps,
+        fromPos: oldPos,
         oldPosition: oldPos,
         newPosition: newPos,
-        passedGo: passedGo,
-        playerCash: curPlayer.cash
-      });
+        passedGo: passedGo
+      }, senderWs);
       break;
     }
 
