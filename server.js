@@ -621,6 +621,11 @@ wss.on("connection", (ws, req) => {
           let player = r.players.find(p => p.id === data.reconnectPlayerId);
           if (player) {
             player.ws = ws;
+            if (player.reconnectTimer) {
+              clearTimeout(player.reconnectTimer);
+              player.reconnectTimer = null;
+              sendSystemRoomNotice(r, `✅ ${player.name} повернувся в кімнату!`);
+            }
           } else {
             const playerId = "p_" + Math.random().toString(36).substring(2, 9);
             const pName = (data.playerName || `Гравець #${r.players.length + 1}`).trim().substring(0, 25);
@@ -810,6 +815,24 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+function sendSystemRoomNotice(room, text) {
+  if (!room) return;
+  const chatItem = {
+    id: "sys_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
+    senderId: "system",
+    senderName: "Система",
+    senderColor: "#F59E0B",
+    text: text,
+    time: new Date().toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" })
+  };
+  room.chat.push(chatItem);
+  if (room.chat.length > 50) room.chat.shift();
+  broadcastToRoom(room.id, {
+    type: "CHAT_MESSAGE",
+    message: chatItem
+  });
+}
+
 function handlePlayerDisconnect(roomId, playerId) {
   const r = rooms.get(roomId);
   if (!r) return;
@@ -822,18 +845,58 @@ function handlePlayerDisconnect(roomId, playerId) {
   if (r.status === "waiting") {
     handlePlayerLeave(roomId, playerId);
   } else {
-    // Якщо під час партії всі люди відключилися — кімната негайно закривається і не зависає
+    // Якщо під час партії всі люди відключилися — даємо 30 сек на повернення, або якщо ніхто не повернувся — закриваємо
     if (connectedHumans.length === 0) {
-      rooms.delete(roomId);
-      broadcastToLobby({
-        type: "ROOMS_UPDATED",
-        rooms: getLobbyRoomsList()
-      });
+      if (r.emptyRoomTimer) clearTimeout(r.emptyRoomTimer);
+      r.emptyRoomTimer = setTimeout(() => {
+        const curRoom = rooms.get(roomId);
+        if (!curRoom) return;
+        const stillOnline = curRoom.players.filter(pl => !pl.isBot && pl.ws && pl.ws.readyState === WebSocket.OPEN);
+        if (stillOnline.length === 0) {
+          rooms.delete(roomId);
+          broadcastToLobby({
+            type: "ROOMS_UPDATED",
+            rooms: getLobbyRoomsList()
+          });
+        }
+      }, 30000);
     } else {
       if (r.hostId === playerId && connectedHumans.length > 0) {
         r.hostId = connectedHumans[0].id;
         r.hostName = connectedHumans[0].name;
         connectedHumans[0].isHost = true;
+      }
+      if (p) {
+        sendSystemRoomNotice(r, `⚠️ ${p.name} покинув кімнату. У нього є 30 сек на повернення...`);
+        if (p.reconnectTimer) clearTimeout(p.reconnectTimer);
+        p.reconnectTimer = setTimeout(() => {
+          const curRoom = rooms.get(roomId);
+          if (!curRoom) return;
+          const target = curRoom.players.find(x => x.id === playerId);
+          if (!target || (target.ws && target.ws.readyState === WebSocket.OPEN)) return;
+
+          target.bankrupt = true;
+          Object.keys(curRoom.tileState || {}).forEach(idx => {
+            if (curRoom.tileState[idx]?.ownerId === target.id) {
+              curRoom.tileState[idx] = { ownerId: null, stars: 0, mortgaged: false };
+            }
+          });
+          if (curRoom.players[curRoom.currentTurnIndex]?.id === target.id) {
+            let nextIdx = (curRoom.currentTurnIndex + 1) % curRoom.players.length;
+            let guard = 0;
+            while (curRoom.players[nextIdx].bankrupt && guard < curRoom.players.length) {
+              nextIdx = (nextIdx + 1) % curRoom.players.length;
+              guard++;
+            }
+            curRoom.currentTurnIndex = nextIdx;
+          }
+          sendSystemRoomNotice(curRoom, `🚪 ${target.name} остаточно покинув кімнату (30 сек вичерпано).`);
+          broadcastToRoom(curRoom.id, {
+            type: "ACTION_BROADCAST",
+            action: "STATE_SYNCED",
+            room: serializeRoom(curRoom)
+          });
+        }, 30000);
       }
       broadcastToRoom(r.id, {
         type: "PLAYER_DISCONNECTED",
@@ -851,6 +914,12 @@ function handlePlayerLeave(roomId, playerId) {
   const r = rooms.get(roomId);
   if (!r) return;
 
+  const leaving = r.players.find(p => p.id === playerId);
+  if (leaving && leaving.reconnectTimer) {
+    clearTimeout(leaving.reconnectTimer);
+    leaving.reconnectTimer = null;
+  }
+
   r.players = r.players.filter(p => p.id !== playerId);
   const remainingHumans = r.players.filter(p => !p.isBot);
 
@@ -862,6 +931,9 @@ function handlePlayerLeave(roomId, playerId) {
       r.hostId = nextHuman.id;
       r.hostName = nextHuman.name;
       nextHuman.isHost = true;
+    }
+    if (leaving) {
+      sendSystemRoomNotice(r, `🚪 ${leaving.name} покинув кімнату.`);
     }
     broadcastToRoom(r.id, {
       type: "ROOM_UPDATED",
@@ -883,8 +955,8 @@ setInterval(() => {
   rooms.forEach((r, roomId) => {
     const connectedHumans = r.players.filter(p => !p.isBot && p.ws && p.ws.readyState === WebSocket.OPEN);
 
-    // 1. Жодного підключеного гравця-людини
-    if (connectedHumans.length === 0) {
+    // 1. Жодного підключеного гравця-людини (якщо не триває 30-секундне очікування повернення)
+    if (connectedHumans.length === 0 && !r.emptyRoomTimer) {
       rooms.delete(roomId);
       changed = true;
       return;
