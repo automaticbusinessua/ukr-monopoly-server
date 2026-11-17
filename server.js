@@ -740,6 +740,7 @@ wss.on("connection", (ws, req) => {
 
           r.status = "playing";
           r.currentTurnIndex = 0;
+          startTurnTimeout(r);
 
           broadcastToRoom(r.id, {
             type: "GAME_STARTED",
@@ -1152,6 +1153,7 @@ function handleGameAction(room, playerId, action, payload, senderWs) {
 
       room.currentTurnIndex = nextIdx;
       const nextPlayer = room.players[nextIdx];
+      startTurnTimeout(room);
 
       broadcastToRoom(room.id, {
         type: "ACTION_BROADCAST",
@@ -1188,8 +1190,12 @@ function handleGameAction(room, playerId, action, payload, senderWs) {
       if (payload.offshorePot !== undefined) {
         room.offshorePot = payload.offshorePot;
       }
+      const prevTurnIdx = room.currentTurnIndex;
       if (typeof payload.currentTurnIndex === "number") {
         room.currentTurnIndex = payload.currentTurnIndex;
+      }
+      if (room.currentTurnIndex !== prevTurnIdx) {
+        startTurnTimeout(room);
       }
       if (payload.turnPhase) {
         room.turnPhase = payload.turnPhase;
@@ -1222,6 +1228,72 @@ function handleGameAction(room, playerId, action, payload, senderWs) {
       break;
     }
   }
+}
+
+function startTurnTimeout(room) {
+  if (!room || room.status !== "playing") return;
+  if (room.turnTimeoutTimer) {
+    clearTimeout(room.turnTimeoutTimer);
+    room.turnTimeoutTimer = null;
+  }
+  const curPlayer = room.players[room.currentTurnIndex];
+  if (!curPlayer || curPlayer.isBot || curPlayer.bankrupt) {
+    room.turnDeadline = null;
+    return;
+  }
+
+  const maxTurnSec = Math.min(60, Math.max(15, Number(room.settings?.turnTimer) || 60));
+  room.turnDeadline = Date.now() + maxTurnSec * 1000;
+
+  room.turnTimeoutTimer = setTimeout(() => {
+    const r = rooms.get(room.id);
+    if (!r || r.status !== "playing") return;
+    const p = r.players[r.currentTurnIndex];
+    if (!p || p.id !== curPlayer.id || p.isBot || p.bankrupt) return;
+
+    p.bankrupt = true;
+    Object.keys(r.tileState || {}).forEach(idx => {
+      if (r.tileState[idx]?.ownerId === p.id) {
+        r.tileState[idx] = { ownerId: null, stars: 0, mortgaged: false };
+      }
+    });
+
+    sendSystemRoomNotice(r, `⏱️ ${p.name} не походив за ${maxTurnSec} сек і був виключений з кімнати!`);
+
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+      p.ws.send(JSON.stringify({
+        type: "ROOM_CLOSED",
+        reason: `Час на хід вичерпано (${maxTurnSec} сек). Вас виключено з кімнати за неактивність.`
+      }));
+      p.ws = null;
+    }
+
+    const aliveHumans = r.players.filter(x => !x.isBot && !x.bankrupt && x.ws && x.ws.readyState === WebSocket.OPEN);
+    if (aliveHumans.length === 0) {
+      rooms.delete(r.id);
+      broadcastToLobby({ type: "ROOMS_UPDATED", rooms: getLobbyRoomsList() });
+      return;
+    }
+
+    let nextIdx = (r.currentTurnIndex + 1) % r.players.length;
+    let guard = 0;
+    while (r.players[nextIdx].bankrupt && guard < r.players.length) {
+      nextIdx = (nextIdx + 1) % r.players.length;
+      guard++;
+    }
+    r.currentTurnIndex = nextIdx;
+    r.turnPhase = "ROLL";
+
+    startTurnTimeout(r);
+    const ser = serializeRoom(r);
+    ser.turnPhase = "ROLL";
+    broadcastToRoom(r.id, {
+      type: "ACTION_BROADCAST",
+      action: "STATE_SYNCED",
+      room: ser
+    });
+    checkAndRunBotTurn(r);
+  }, maxTurnSec * 1000);
 }
 
 // Автоматичний хід бота в кімнаті з таймером
@@ -1267,6 +1339,7 @@ function checkAndRunBotTurn(room) {
       }
       room.currentTurnIndex = nextIdx;
       const nextPlayer = room.players[nextIdx];
+      startTurnTimeout(room);
 
       broadcastToRoom(room.id, {
         type: "ACTION_BROADCAST",
@@ -1292,6 +1365,7 @@ function serializeRoom(r) {
     createdAt: r.createdAt,
     settings: r.settings,
     currentTurnIndex: r.currentTurnIndex,
+    turnDeadline: r.turnDeadline || null,
     offshorePot: r.offshorePot,
     tileState: r.tileState,
     players: r.players.map(p => ({
